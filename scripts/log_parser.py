@@ -3,6 +3,11 @@ import datetime
 import csv
 
 class ApacheLogParser:
+    """Parse Apache log data."""
+
+    _DATE_TIME_FORMAT = '%d/%b/%Y:%H:%M:%S %z'
+    _ISO_8601_FORMAT = '%Y-%m-%d %H:%M:%S'
+
     def __init__(self) -> None:
         """Initialize the ApacheLogParser with given log formats."""
         log_formats = [
@@ -29,9 +34,8 @@ class ApacheLogParser:
     def _parse_date_time(self, data: dict) -> None:
         """Parse and format the date_time field in the data dictionary."""
         try:
-            date_time_obj = datetime.datetime.strptime(
-                data['date_time'], '%d/%b/%Y:%H:%M:%S %z')
-            data['date_time'] = date_time_obj.strftime('%Y-%m-%d %H:%M:%S')  # ISO 8601 format
+            date_time_obj = datetime.datetime.strptime(data['date_time'], self._DATE_TIME_FORMAT)
+            data['date_time'] = date_time_obj.strftime(self._ISO_8601_FORMAT)
         except ValueError:
             data['date_time'] = None
 
@@ -42,6 +46,17 @@ class ApacheLogParser:
     def _parse_size(self, data: dict) -> None:
         """Parse and convert the size field to an integer in the data dictionary."""
         data['size'] = int(data['size']) if data['size'].isdigit() else None
+
+
+def read_file(file_path: str, parser: ApacheLogParser) -> list:
+    """Read a file and parse its contents using the given parser."""
+    try:
+        with open(file_path, 'r') as file:
+            return [parser.parse(line) for line in file if parser.parse(line)]
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Log file not found: {file_path}")
+    except Exception as e:
+        raise Exception(f"An error occurred while reading the log file: {e}")
 
 
 def save_to_csv(data: list, csv_file: str) -> None:
@@ -63,18 +78,14 @@ def save_to_csv(data: list, csv_file: str) -> None:
         print(f"ERROR: Could not save data to CSV: {e}")
 
 
+def main(log_file: str, csv_file: str) -> None:
+    """Parse Apache log data and save to CSV file."""
+    parser = ApacheLogParser()
+    parsed_data = read_file(log_file, parser)
+    save_to_csv(parsed_data, csv_file)
+
+
 if __name__ == '__main__':
     log_file = 'data/apache_logs.txt'
     csv_file = 'data/parsed_logs.csv'
-    parser = ApacheLogParser()
-    parsed_data = []
-
-    try:
-        with open(log_file, 'r') as f:
-            parsed_data = [parser.parse(line) for line in f if parser.parse(line)]
-    except FileNotFoundError:
-        print(f"ERROR: Log file not found: {log_file}")
-    except Exception as e:
-        print(f"ERROR: An error occurred while reading the log file: {e}")
-
-    save_to_csv(parsed_data, csv_file)
+    main(log_file, csv_file)
