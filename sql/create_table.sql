@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS apache_logs (
     request_url TEXT NOT NULL,
     status_code SMALLINT NULL,
     response_size BIGINT NULL,
-    referer_url TEXT,
+    referer TEXT,
     user_agent TEXT,
     row_hash VARCHAR(64) UNIQUE
 );

@@ -1,178 +1,199 @@
 import os
-import csv
-import sys
 import hashlib
+import sys
+import time
+import pandas as pd
 import psycopg2
 from psycopg2 import extras
-import time
+from typing import Optional, List, Tuple
+from dataclasses import dataclass
+
+
+@dataclass
+class DBConfig:
+    """Database configuration."""
+    host: str
+    port: str
+    dbname: str
+    user: str
+    password: str
+
 
 class DatabaseLoader:
-    """Load data from CSV file to PostgreSQL database."""
-    def __init__(self):
-        """Initialize DatabaseLoader with environment variables."""
-        self._host = os.environ.get("DB_HOST")
-        self._port = os.environ.get("DB_PORT")
-        self._db_name = os.environ.get("DB_NAME")
-        self._user = os.environ.get("DB_USER")
-        self._password = os.environ.get("DB_PASSWORD")
-        self._csv_file = "data/parsed_logs.csv"  # Path to CSV file
-        self.hash_file = "data/csv_hash.txt"  # File to store the hash
+    """Loads and manages data from CSV to PostgreSQL database with change detection."""
 
-        if not all([
-            self._host, self._port, self._db_name, self._user, self._password
-        ]):
-            raise EnvironmentError("Missing environment variables for database connection.")
+    CSV_PATH = "data/parsed_logs.csv"
+    HASH_PATH = "data/csv_hash.txt"
+    BATCH_SIZE = 1000
+
+    def __init__(self) -> None:
+        """Initialize database loader."""
+        self.config = self._load_config()
+        self._validate_config()
+        self.conn: Optional[psycopg2.extensions.connection] = None
+
+    def _load_config(self) -> DBConfig:
+        """Load and validate database configuration from environment variables."""
+        required_vars = ["DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"]
+        missing = [var for var in required_vars if var not in os.environ]
+        if missing:
+            raise EnvironmentError(f"Missing environment variables: {', '.join(missing)}")
         
-        self.batch_size = 1000  # Batch size for insert
+        return DBConfig(
+            host=os.environ["DB_HOST"],
+            port=os.environ["DB_PORT"],
+            dbname=os.environ["DB_NAME"],
+            user=os.environ["DB_USER"],
+            password=os.environ["DB_PASSWORD"]
+        )
 
+    def _validate_config(self) -> None:
+        """Validate database configuration."""
+        if not all(vars(self.config).values()):
+            raise EnvironmentError("Missing database configuration in environment variables")
 
-    def _calculate_file_hash(self, filepath: str) -> str:
-        """Calculate the SHA-256 hash of a file."""
+    def _calculate_file_hash(self) -> Optional[str]:
+        """Calculate SHA-256 hash of the CSV file."""
         hasher = hashlib.sha256()
         try:
-            with open(filepath, 'rb') as file:
-                while True:
-                    chunk = file.read(4096)
-                    if not chunk:
-                        break
+            with open(self.CSV_PATH, 'rb') as f:
+                for chunk in iter(lambda: f.read(4096), b''):
                     hasher.update(chunk)
+            return hasher.hexdigest()
         except FileNotFoundError:
-            print(f"File not found: {filepath}")
+            print(f"Error: CSV file not found at {self.CSV_PATH}")
             return None
-        return hasher.hexdigest()
 
-
-    def _check_if_file_changed(self):
-        """Check if the CSV file has changed since the last load."""
-        current_hash = self._calculate_file_hash(self._csv_file)
-        if current_hash is None:
-            return False  # File not found, assume it hasn't changed
+    def _check_file_changes(self) -> bool:
+        """Check if CSV file has changed since last load."""
+        current_hash = self._calculate_file_hash()
+        if not current_hash:
+            return False
 
         try:
-            with open(self.hash_file, 'r') as file:
-                previous_hash = file.read().strip()
+            with open(self.HASH_PATH, 'r') as f:
+                previous_hash = f.read().strip()
         except FileNotFoundError:
-            previous_hash = None  # No previous hash found
+            previous_hash = ''
 
         if current_hash != previous_hash:
-            # Save new hash
-            with open(self.hash_file, 'w') as file:
-                file.write(current_hash)
-            return True  # File has changed
-        return False  # File hasn't changed
+            with open(self.HASH_PATH, 'w') as f:
+                f.write(current_hash)
+            return True
+        return False
 
-
-    def _hash_row(self, row: list) -> str:
-        """Calculates the SHA-256 hash of a CSV row."""
-        row_str = ','.join(str(x) for x in row).encode('utf-8')
-        return hashlib.sha256(row_str).hexdigest()
-
-
-    def _connect(self):
-        """Connect to PostgreSQL database and return cursor."""
+    def _connect(self) -> psycopg2.extensions.connection:
+        """Establish database connection."""
         try:
-            print("Attempting to connect to the database...")
-            connection = psycopg2.connect(
-                host=self._host,
-                port=self._port,
-                dbname=self._db_name,
-                user=self._user,
-                password=self._password
+            self.conn = psycopg2.connect(
+                host=self.config.host,
+                port=self.config.port,
+                dbname=self.config.dbname,
+                user=self.config.user,
+                password=self.config.password
             )
-            print("Database connection established successfully.")
-            return connection.cursor()
-        except psycopg2.OperationalError as error:
-            print("OperationalError: Failed to connect to the database.")
-            raise ConnectionRefusedError(
-                "Failed to connect to the database. Ensure PostgreSQL is running and connection parameters are correct."
-            ) from error
-        except psycopg2.Error as error:
-            print(f"DatabaseError: {error}")
-            raise error
+            return self.conn
+        except psycopg2.OperationalError as e:
+            raise ConnectionError(f"Database connection failed: {e}") from e
 
+    def _prepare_data(self) -> Optional[List[Tuple]]:
+        """Load and prepare data from CSV using pandas with type conversion."""
+        try:
+            df = pd.read_csv(
+                self.CSV_PATH,
+                parse_dates=['log_timestamp'],
+                na_values=['-']
+            )
+        except FileNotFoundError:
+            print(f"Error: CSV file not found at {self.CSV_PATH}")
+            return None
 
-    def _load_data_to_db(self, cursor: psycopg2.extensions.cursor) -> None:
-        if not self._check_if_file_changed():
-            print("The file has not changed. Skipping database load.")
-            return
+        # Replace NaN and convert to standard Python types
+        df = df.fillna({'status_code': 0, 'response_size': 0})
 
-        with open(self._csv_file, 'r', encoding='utf-8') as file:
-            csv_reader = csv.reader(file)
-            next(csv_reader)  # Skip header
-            batch_data = []
-            
-            for row in csv_reader:
-                row_hash = self._hash_row(row)
-                cursor.execute("SELECT EXISTS (SELECT 1 FROM apache_logs WHERE row_hash = %s)", (row_hash,))
-                hash_exists = cursor.fetchone()[0]
-                
-                if not hash_exists:
-                    ip, timestamp, url, status, size, referer, agent = row
-                    status = int(status) if status else None
-                    size = int(size) if size else None
-                    batch_data.append((ip, timestamp, url, status, size, referer, agent, row_hash))
-                    
-                if len(batch_data) >= self.batch_size:
-                    self._execute_batch(cursor, batch_data)
-                    batch_data = []
+        # Explicit type conversion
+        df['status_code'] = df['status_code'].astype(int)
+        df['response_size'] = df['response_size'].astype(int)
 
-            if batch_data:
-                self._execute_batch(cursor, batch_data)
+        # Generate hashes
+        df['row_hash'] = df.apply(
+            lambda row: hashlib.sha256(
+                ','.join(map(str, row.values)).encode()
+            ).hexdigest(),
+            axis=1
+        )
 
+        # Convert data frame to list of tuples with standard Python types
+        result = df.apply(
+            lambda row: (
+                str(row.ip_address),
+                row.log_timestamp.to_pydatetime(),
+                str(row.request_url),
+                int(row.status_code),
+                int(row.response_size),
+                str(row.referer),
+                str(row.user_agent),
+                str(row.row_hash)
+            ),
+            axis=1
+        ).tolist()
 
-    def _execute_batch(self, cursor: psycopg2.extensions.cursor, batch_data: list) -> None:
-        """Executes the batch insert, handling potential duplicates."""
-        if not batch_data:
-            print("No data to insert in batch.")
-            return
+        return result
 
-        unique_data = []
-        seen_hashes = set()
-        for row in batch_data:
-            row_hash = row[-1]
-            if row_hash not in seen_hashes:
-                unique_data.append(row)
-                seen_hashes.add(row_hash)
-
-        if not unique_data:
-            print("No unique data to insert in batch.")
-            return
-
+    def _execute_batch_insert(self, cursor: psycopg2.extensions.cursor, data: List[Tuple]) -> None:
+        """Execute batch insert with conflict handling."""
         query = """
-            INSERT INTO apache_logs
-            (ip_address, log_timestamp, request_url, status_code, response_size, referer_url, user_agent, row_hash)
-            VALUES %s
+            INSERT INTO apache_logs (
+                ip_address, log_timestamp, request_url, 
+                status_code, response_size, referer, 
+                user_agent, row_hash
+            ) VALUES %s
+            ON CONFLICT (row_hash) DO NOTHING
         """
         try:
-            extras.execute_values(cursor, query, unique_data)
-        except psycopg2.errors.UniqueViolation as e:
-            print(f"Unique violation error: {e}")
+            extras.execute_values(
+                cursor, query, data, page_size=self.BATCH_SIZE
+            )
+        except psycopg2.Error as error:
+            print(f"Database error during insert: {error}")
             raise
 
+    def load_data(self) -> None:
+        """Main method to load data into database."""
+        if not self._check_file_changes():
+            print("No changes detected in CSV file. Skipping load.")
+            return
 
-    def load_data_to_db(self):
-        """Load data from CSV file to PostgreSQL database."""
         start_time = time.time()
+        data = self._prepare_data()
+        if not data:
+            return
+
         try:
-            cursor = self._connect()
-            self._load_data_to_db(cursor)
-            cursor.connection.commit()
-        except (ConnectionRefusedError, FileNotFoundError) as error:
-            print(f"{type(error).__name__}: {error}")
-            sys.exit(1)
-        except psycopg2.Error as error:
-            cursor.connection.rollback()
-            raise error
-        except Exception as error:
-            cursor.connection.rollback()
-            raise error
+            with self._connect() as conn:
+                with conn.cursor() as cursor:
+                    self._execute_batch_insert(cursor, data)
+                    conn.commit()
+                    print(f"Successfully inserted {len(data)} rows")
+
+        except psycopg2.Error as e:
+            print(f"Database error: {e}")
+            conn.rollback()
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            if conn:
+                conn.rollback()
         finally:
-            cursor.close()
-            cursor.connection.close()
-        end_time = time.time()
-        print(f"Execution time: {end_time - start_time:.2f} seconds")
+            if conn:
+                conn.close()
+            print(f"Execution time: {time.time() - start_time:.2f} seconds")
 
 
 if __name__ == "__main__":
-    loader = DatabaseLoader()
-    loader.load_data_to_db()
+    try:
+        loader = DatabaseLoader()
+        loader.load_data()
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        sys.exit(1)
+
